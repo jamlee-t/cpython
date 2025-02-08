@@ -6,10 +6,8 @@ import re
 import signal
 import subprocess
 import sys
-import sysconfig
 from test import support
-from test.support import os_helper
-from test.support import script_helper, is_android
+from test.support import os_helper, script_helper, is_android, MS_WINDOWS, threading_helper
 import tempfile
 import unittest
 from textwrap import dedent
@@ -19,18 +17,10 @@ try:
 except ImportError:
     _testcapi = None
 
+if not support.has_subprocess_support:
+    raise unittest.SkipTest("test module requires subprocess")
+
 TIMEOUT = 0.5
-MS_WINDOWS = (os.name == 'nt')
-_cflags = sysconfig.get_config_var('CFLAGS') or ''
-_config_args = sysconfig.get_config_var('CONFIG_ARGS') or ''
-UB_SANITIZER = (
-    '-fsanitize=undefined' in _cflags or
-    '--with-undefined-behavior-sanitizer' in _config_args
-)
-MEMORY_SANITIZER = (
-    '-fsanitize=memory' in _cflags or
-    '--with-memory-sanitizer' in _config_args
-)
 
 
 def expected_traceback(lineno1, lineno2, header, min_count=1):
@@ -43,7 +33,7 @@ def expected_traceback(lineno1, lineno2, header, min_count=1):
         return '^' + regex + '$'
 
 def skip_segfault_on_android(test):
-    # Issue #32138: Raising SIGSEGV on Android may not cause a crash.
+    # gh-76319: Raising SIGSEGV on Android may not cause a crash.
     return unittest.skipIf(is_android,
                            'raising SIGSEGV on Android is unreliable')(test)
 
@@ -71,8 +61,16 @@ class FaultHandlerTests(unittest.TestCase):
         pass_fds = []
         if fd is not None:
             pass_fds.append(fd)
+        env = dict(os.environ)
+
+        # Sanitizers must not handle SIGSEGV (ex: for test_enable_fd())
+        option = 'handle_segv=0'
+        support.set_sanitizer_env_var(env, option)
+
         with support.SuppressCrashReport():
-            process = script_helper.spawn_python('-c', code, pass_fds=pass_fds)
+            process = script_helper.spawn_python('-c', code,
+                                                 pass_fds=pass_fds,
+                                                 env=env)
             with process:
                 output, stderr = process.communicate()
                 exitcode = process.wait()
@@ -102,7 +100,11 @@ class FaultHandlerTests(unittest.TestCase):
 
         Raise an error if the output doesn't match the expected format.
         """
-        if all_threads:
+        all_threads_disabled = (
+            all_threads
+            and (not sys._is_gil_enabled())
+        )
+        if all_threads and not all_threads_disabled:
             if know_current_thread:
                 header = 'Current thread 0x[0-9a-f]+'
             else:
@@ -113,10 +115,15 @@ class FaultHandlerTests(unittest.TestCase):
         if py_fatal_error:
             regex.append("Python runtime state: initialized")
         regex.append('')
+        if all_threads_disabled and not py_fatal_error:
+            regex.append("<Cannot show all threads while the GIL is disabled>")
         regex.append(fr'{header} \(most recent call first\):')
-        if garbage_collecting:
-            regex.append('  Garbage-collecting')
-        regex.append(fr'  File "<string>", line {lineno} in {function}')
+        if support.Py_GIL_DISABLED and py_fatal_error and not know_current_thread:
+            regex.append("  <tstate is freed>")
+        else:
+            if garbage_collecting and not all_threads_disabled:
+                regex.append('  Garbage-collecting')
+            regex.append(fr'  File "<string>", line {lineno} in {function}')
         regex = '\n'.join(regex)
 
         if other_regex:
@@ -238,7 +245,7 @@ class FaultHandlerTests(unittest.TestCase):
             faulthandler._sigfpe()
             """,
             3,
-            'Floating point exception')
+            'Floating-point exception')
 
     @unittest.skipIf(_testcapi is None, 'need _testcapi')
     @unittest.skipUnless(hasattr(signal, 'SIGBUS'), 'need signal.SIGBUS')
@@ -268,6 +275,7 @@ class FaultHandlerTests(unittest.TestCase):
             5,
             'Illegal instruction')
 
+    @unittest.skipIf(_testcapi is None, 'need _testcapi')
     def check_fatal_error_func(self, release_gil):
         # Test that Py_FatalError() dumps a traceback
         with support.SuppressCrashReport():
@@ -277,7 +285,7 @@ class FaultHandlerTests(unittest.TestCase):
                 """,
                 2,
                 'xyz',
-                func='test_fatal_error',
+                func='_testcapi_fatal_error_impl',
                 py_fatal_error=True)
 
     def test_fatal_error(self):
@@ -311,8 +319,6 @@ class FaultHandlerTests(unittest.TestCase):
             3,
             'Segmentation fault')
 
-    @unittest.skipIf(UB_SANITIZER or MEMORY_SANITIZER,
-                     "sanitizer builds change crashing process output.")
     @skip_segfault_on_android
     def test_enable_file(self):
         with temporary_filename() as filename:
@@ -328,8 +334,6 @@ class FaultHandlerTests(unittest.TestCase):
 
     @unittest.skipIf(sys.platform == "win32",
                      "subprocess doesn't support pass_fds on Windows")
-    @unittest.skipIf(UB_SANITIZER or MEMORY_SANITIZER,
-                     "sanitizer builds change crashing process output.")
     @skip_segfault_on_android
     def test_enable_fd(self):
         with tempfile.TemporaryFile('wb+') as fp:
@@ -412,6 +416,7 @@ class FaultHandlerTests(unittest.TestCase):
         finally:
             sys.stderr = orig_stderr
 
+    @support.requires_subprocess()
     def test_disabled_by_default(self):
         # By default, the module should be disabled
         code = "import faulthandler; print(faulthandler.is_enabled())"
@@ -420,6 +425,7 @@ class FaultHandlerTests(unittest.TestCase):
         output = subprocess.check_output(args)
         self.assertEqual(output.rstrip(), b"False")
 
+    @support.requires_subprocess()
     def test_sys_xoptions(self):
         # Test python -X faulthandler
         code = "import faulthandler; print(faulthandler.is_enabled())"
@@ -432,6 +438,7 @@ class FaultHandlerTests(unittest.TestCase):
         output = subprocess.check_output(args, env=env)
         self.assertEqual(output.rstrip(), b"True")
 
+    @support.requires_subprocess()
     def test_env_var(self):
         # empty env var
         code = "import faulthandler; print(faulthandler.is_enabled())"
@@ -577,10 +584,12 @@ class FaultHandlerTests(unittest.TestCase):
             lineno = 8
         else:
             lineno = 10
+        # When the traceback is dumped, the waiter thread may be in the
+        # `self.running.set()` call or in `self.stop.wait()`.
         regex = r"""
             ^Thread 0x[0-9a-f]+ \(most recent call first\):
             (?:  File ".*threading.py", line [0-9]+ in [_a-z]+
-            ){{1,3}}  File "<string>", line 23 in run
+            ){{1,3}}  File "<string>", line (?:22|23) in run
               File ".*threading.py", line [0-9]+ in _bootstrap_inner
               File ".*threading.py", line [0-9]+ in _bootstrap
 
@@ -680,6 +689,7 @@ class FaultHandlerTests(unittest.TestCase):
         with tempfile.TemporaryFile('wb+') as fp:
             self.check_dump_traceback_later(fd=fp.fileno())
 
+    @support.requires_resource('walltime')
     def test_dump_traceback_later_twice(self):
         self.check_dump_traceback_later(loops=2)
 
@@ -785,6 +795,7 @@ class FaultHandlerTests(unittest.TestCase):
     def test_register_threads(self):
         self.check_register(all_threads=True)
 
+    @support.skip_if_sanitizer("gh-129825: hangs under TSAN", thread=True)
     def test_register_chain(self):
         self.check_register(chain=True)
 
@@ -895,6 +906,34 @@ class FaultHandlerTests(unittest.TestCase):
         self.assertEqual(output, [])
         self.assertEqual(exitcode, 0)
 
+    @threading_helper.requires_working_threading()
+    @unittest.skipUnless(support.Py_GIL_DISABLED, "only meaningful if the GIL is disabled")
+    def test_free_threaded_dump_traceback(self):
+        # gh-128400: Other threads need to be paused to invoke faulthandler
+        code = dedent("""
+        import faulthandler
+        from threading import Thread, Event
+
+        class Waiter(Thread):
+            def __init__(self):
+                Thread.__init__(self)
+                self.running = Event()
+                self.stop = Event()
+
+            def run(self):
+                self.running.set()
+                self.stop.wait()
+
+        for _ in range(100):
+            waiter = Waiter()
+            waiter.start()
+            waiter.running.wait()
+            faulthandler.dump_traceback(all_threads=True)
+            waiter.stop.set()
+            waiter.join()
+        """)
+        _, exitcode = self.get_output(code)
+        self.assertEqual(exitcode, 0)
 
 if __name__ == "__main__":
     unittest.main()
